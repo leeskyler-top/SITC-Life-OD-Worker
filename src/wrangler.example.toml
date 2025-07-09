@@ -1,0 +1,11 @@
+name = "twlife-od"
+main = "worker.js"
+compatibility_date = "2023-08-23"
+
+[unsafe.metadata.observability]
+enabled = true
+
+[vars]
+FLASK_BACKEND_BASE = "https://dev-tunnel.leeskyler.top/"
+PUBLIC_BASE_URL = "https://twlife-od.leeskyler.top"
+CLOUDFLARE_HMAC_SECRET = "cloudflare_hmac_secret"
