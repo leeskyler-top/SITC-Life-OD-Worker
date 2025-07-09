@@ -1,10 +1,29 @@
+const uploadSessionMap = new Map();
+
+function detectMimeFromMagicBytes(bytes) {
+	const hex = Array.from(bytes.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+	if (hex.startsWith('FFD8FF')) return 'image/jpeg';
+	if (hex.startsWith('89504E47')) return 'image/png';
+	if (hex.startsWith('47494638')) return 'image/gif';
+	if (hex.startsWith('424D')) return 'image/bmp';
+	if (hex.startsWith('52494646')) return 'image/webp';
+	return 'application/octet-stream';
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 
-		// OPTIONS 预检请求
 		if (request.method === 'OPTIONS') {
 			return new Response(null, { status: 204, headers: corsHeaders() });
+		}
+
+		// 清理过期的 upload sessions
+		const now = Date.now();
+		for (const [key, session] of uploadSessionMap.entries()) {
+			if (new Date(session.expirationDateTime).getTime() < now) {
+				uploadSessionMap.delete(key);
+			}
 		}
 
 		const routeHandlers = {
@@ -63,7 +82,13 @@ async function handleDownload(request, env, url) {
 
 	const headers = new Headers();
 	for (const [key, value] of fileRes.headers.entries()) {
-		if (['content-type', 'content-length', 'content-disposition', 'last-modified', 'etag'].includes(key.toLowerCase())) {
+		if ([
+			'content-type',
+			'content-length',
+			'content-disposition',
+			'last-modified',
+			'etag'
+		].includes(key.toLowerCase())) {
 			headers.set(key, value);
 		}
 	}
@@ -85,6 +110,11 @@ async function handleUploadSession(request, env) {
 	const { file_name, file_size } = body;
 	if (!file_name || !file_size) return jsonResponse({ status: 'fail', msg: 'Missing file_name or file_size' }, 400);
 
+	const lower = file_name.toLowerCase();
+	if (!lower.endsWith('.jpg') && !lower.endsWith('.jpeg') && !lower.endsWith('.png') && !lower.endsWith('.gif') && !lower.endsWith('.bmp') && !lower.endsWith('.webp')) {
+		return jsonResponse({ status: 'fail', msg: 'Only image file extensions are allowed' }, 415);
+	}
+
 	const tokenData = await getTokenFromFlask(env, userJwt, request);
 	if (!tokenData) return jsonResponse({ status: 'fail', msg: 'Failed to get Microsoft Graph token' }, 500);
 
@@ -104,12 +134,19 @@ async function handleUploadSession(request, env) {
 	}
 
 	const sessionData = await sessionRes.json();
+	const uploadId = sessionData.id || crypto.randomUUID();
+	const guid = new URL(sessionData.uploadUrl).searchParams.get('guid') || crypto.randomUUID();
+
+	uploadSessionMap.set(`${uploadId}:${guid}`, {
+		uploadUrl: sessionData.uploadUrl,
+		expirationDateTime: sessionData.expirationDateTime,
+		validated: false
+	});
+
 	return jsonResponse({
-		status: 'success', msg: 'Upload session created', data: {
-			uploadUrl: sessionData.uploadUrl,
-			expirationDateTime: sessionData.expirationDateTime,
-			fileId: sessionData.id || null
-		}
+		status: 'success',
+		msg: 'Upload session created',
+		data: { uploadId, guid, expirationDateTime: sessionData.expirationDateTime }
 	});
 }
 
@@ -117,17 +154,32 @@ async function handleUploadChunk(request, env) {
 	const [userJwt, errorResponse] = await authenticate(request, env);
 	if (errorResponse) return errorResponse;
 
+	const uploadId = request.headers.get('X-Upload-Id');
+	const guid = request.headers.get('X-Upload-Guid');
 	const contentRange = request.headers.get('X-Content-Range');
-	const uploadUrl = request.headers.get('X-Upload-Url');
 	const contentLength = request.headers.get('Content-Length');
-
-	if (!uploadUrl || !contentRange || !contentLength) {
+	if (!uploadId || !guid || !contentRange || !contentLength) {
 		return jsonResponse({ status: 'fail', msg: 'Missing headers' }, 400);
 	}
 
-	const chunk = await request.arrayBuffer();
+	const key = `${uploadId}:${guid}`;
+	const session = uploadSessionMap.get(key);
+	if (!session) {
+		return jsonResponse({ status: 'fail', msg: 'Upload session not found or expired' }, 404);
+	}
 
-	const res = await fetch(uploadUrl, {
+	const chunk = new Uint8Array(await request.arrayBuffer());
+
+	if (!session.validated && contentRange.startsWith('bytes 0-')) {
+		const mime = detectMimeFromMagicBytes(chunk);
+		if (!mime.startsWith('image/')) {
+			return jsonResponse({ status: 'fail', msg: `Invalid file type: ${mime}` }, 415);
+		}
+		session.validated = true;
+		uploadSessionMap.set(key, session);
+	}
+
+	const res = await fetch(session.uploadUrl, {
 		method: 'PUT',
 		headers: {
 			'Content-Length': contentLength,
@@ -142,7 +194,27 @@ async function handleUploadChunk(request, env) {
 		return jsonResponse({ status: 'fail', msg: 'Upload chunk failed', detail: error }, status);
 	}
 
-	return jsonResponse({ status: 'success', msg: 'Chunk uploaded', graph_status: status });
+	if ([200, 201].includes(status)) {
+		// 上传完成，提取返回的文件 id 构造下载链接
+		const uploadedData = await res.json();
+		const baseUrl = env.PUBLIC_BASE_URL || `${new URL(request.url).origin}`;
+		const publicUrl = `${baseUrl}/download/${uploadedData.id}`;
+
+		return jsonResponse({
+			status: 'success',
+			msg: 'Upload complete',
+			data: {
+				graph_status: status,
+				url: publicUrl
+			}
+		});
+	} else if (status === 202) {
+		// 分片还未完成
+		return jsonResponse({ status: 'success', msg: 'Chunk uploaded', graph_status: status });
+	} else {
+		const error = await safeText(res);
+		return jsonResponse({ status: 'fail', msg: 'Upload chunk failed', detail: error }, status);
+	}
 }
 
 async function handleUpload(request, env) {
@@ -157,8 +229,14 @@ async function handleUpload(request, env) {
 	}
 
 	const file = formData.get('image_url');
-	if (!(file instanceof File) || !file.type.startsWith('image/')) {
-		return jsonResponse({ status: 'fail', msg: 'Only image files are allowed' }, 415);
+	if (!(file instanceof File)) {
+		return jsonResponse({ status: 'fail', msg: 'Missing file' }, 400);
+	}
+
+	const buffer = new Uint8Array(await file.arrayBuffer());
+	const mime = detectMimeFromMagicBytes(buffer);
+	if (!mime.startsWith('image/')) {
+		return jsonResponse({ status: 'fail', msg: `Invalid image type: ${mime}` }, 415);
 	}
 
 	const tokenData = await getTokenFromFlask(env, userJwt, request);
@@ -184,7 +262,7 @@ async function handleUpload(request, env) {
 			'Content-Length': file.size,
 			'Content-Range': `bytes 0-${file.size - 1}/${file.size}`
 		},
-		body: file
+		body: buffer
 	});
 
 	if (![200, 201].includes(putRes.status)) {
@@ -197,6 +275,7 @@ async function handleUpload(request, env) {
 
 	return jsonResponse({ status: 'success', msg: 'Upload successful', data: { url: publicUrl } });
 }
+
 
 function extractToken(authHeader) {
 	return authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
@@ -235,8 +314,7 @@ async function getTokenFromFlask(env, userJwt, request) {
 async function generateSignature(ip, secret) {
 	const encoder = new TextEncoder();
 	const key = await crypto.subtle.importKey('raw', encoder.encode(secret), {
-		name: 'HMAC',
-		hash: 'SHA-256'
+		name: 'HMAC', hash: 'SHA-256'
 	}, false, ['sign']);
 	const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(ip));
 	return Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -253,7 +331,7 @@ function corsHeaders() {
 	return {
 		'Access-Control-Allow-Origin': '*',
 		'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-		'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Upload-Url, X-Content-Range'
+		'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Upload-Url, X-Content-Range, X-Upload-Id, X-Upload-Guid'
 	};
 }
 

@@ -1,155 +1,145 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Cloudflare Worker 中转上传</title>
+	<meta charset="UTF-8">
+	<title>Cloudflare Worker 中转上传</title>
 </head>
 <body>
 <h2>上传图片到 OneDrive（Cloudflare Worker 中转）</h2>
+
 <h3>HTTP API</h3>
-<textarea id="http-api"></textarea>
+<textarea id="http-api" style="width: 80%; height: 2em;">https://你的worker地址</textarea>
 <br><br>
+
 <h3>JWT Token</h3>
-<textarea id="jwt-token"></textarea>
+<textarea id="jwt-token" style="width: 80%; height: 4em;"></textarea>
 <br><br>
+
 <input type="file" id="fileInput" accept="image/*">
 <br><br>
 <button onclick="startUpload()">开始上传</button>
 <pre id="log"></pre>
 <br><br>
+
 <h3>Download ID</h3>
 <input id="download-id"/>
 <button id="button-test">Download Test</button>
 
-
 <script>
-    function log(msg) {
-        document.getElementById('log').textContent += msg + '\n';
-    }
+	function log(msg) {
+		document.getElementById('log').textContent += msg + '\n';
+	}
 
-    async function startUpload() {
-        const file = document.getElementById('fileInput').files[0];
-        const workerBaseUrl = document.querySelector("#http-api").value;
-        const userJwt = document.querySelector("#jwt-token").value;
-        console.log(userJwt);
-        if (!file) {
-            log('❌ 请先选择文件');
-            return;
-        }
+	async function startUpload() {
+		const file = document.getElementById('fileInput').files[0];
+		const workerBaseUrl = document.getElementById("http-api").value.trim();
+		const userJwt = document.getElementById("jwt-token").value.trim();
 
-        log(`✅ 选择文件：${file.name} (${file.size} bytes)`);
+		if (!file) return log('❌ 请先选择文件');
+		if (!workerBaseUrl || !userJwt) return log('❌ API 地址或 JWT 缺失');
 
-        // 1. 创建上传会话
-        const sessionRes = await fetch(`${workerBaseUrl}/upload-session`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${userJwt}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                file_name: file.name,
-                file_size: file.size
-            })
-        });
+		log(`✅ 选择文件：${file.name} (${file.size} bytes)`);
 
-        const sessionData = await sessionRes.json();
-        if (sessionData.status !== 'success') {
-            log('❌ 创建上传会话失败: ' + sessionData.msg);
-            return;
-        }
+		// 创建上传会话
+		const sessionRes = await fetch(`${workerBaseUrl}/upload-session`, {
+			method: 'POST',
+			headers: {
+				'Authorization': `Bearer ${userJwt}`,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify({
+				file_name: file.name,
+				file_size: file.size
+			})
+		});
 
-        const uploadUrl = sessionData.data.uploadUrl;
-        log('✅ 创建上传会话成功');
-        log('📦 开始上传...');
+		const sessionData = await sessionRes.json();
+		if (sessionData.status !== 'success') {
+			log('❌ 创建上传会话失败: ' + sessionData.msg);
+			return;
+		}
 
-        // 2. 分片上传
-        const chunkSize = 40960 * 1024; // 每块 80MB
-        const totalSize = file.size;
-        let uploaded = 0;
+		const { uploadId, guid } = sessionData.data;
+		log('✅ 上传会话创建成功');
+		log('📦 开始上传分片...');
 
-        while (uploaded < totalSize) {
-            const end = Math.min(uploaded + chunkSize, totalSize);
-            const chunk = file.slice(uploaded, end);
-            const contentRange = `bytes ${uploaded}-${end - 1}/${totalSize}`;
+		const chunkSize = 80 * 1024 * 1024; // 80MB
+		let uploaded = 0;
+		while (uploaded < file.size) {
+			const end = Math.min(uploaded + chunkSize, file.size);
+			const chunk = file.slice(uploaded, end);
+			const contentRange = `bytes ${uploaded}-${end - 1}/${file.size}`;
 
-            const chunkRes = await fetch(`${workerBaseUrl}/upload-chunk`, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${userJwt}`,
-                    'X-Content-Range': contentRange,
-                    'X-Upload-Url': uploadUrl,
-                    'Content-Length': chunk.size
-                },
-                body: chunk
-            });
+			const res = await fetch(`${workerBaseUrl}/upload-chunk`, {
+				method: 'POST',
+				headers: {
+					'Authorization': `Bearer ${userJwt}`,
+					'X-Upload-Id': uploadId,
+					'X-Upload-Guid': guid,
+					'X-Content-Range': contentRange,
+					'Content-Length': chunk.size
+				},
+				body: chunk
+			});
 
-            const json = await chunkRes.json();
-            if (json.status !== 'success') {
-                log(`❌ 上传失败 at ${contentRange}: ${json.msg}`);
-                return;
-            }
+			const json = await res.json();
+			if (json.status === 'success' && json.data?.url) {
+				log('🎉 上传完成，文件地址：' + json.data.url);
+			}
+			if (json.status !== 'success') {
+				log(`❌ 上传失败 (${contentRange}): ${json.msg}`);
+				return;
+			}
 
-            log(`✅ 上传分片成功：${contentRange}`);
-            uploaded = end;
-        }
+			log(`✅ 分片上传成功: ${contentRange}`);
+			uploaded = end;
+		}
 
-        log('🎉 文件上传完成！');
-    }
+		log('🎉 文件上传完成！');
+	}
 
-    document.getElementById('button-test').addEventListener('click', async function () {
-        const workerBaseUrl = document.querySelector("#http-api").value;
-        const userJwt = document.querySelector("#jwt-token").value;
-        const downloadId = document.getElementById('download-id').value;
+	document.getElementById('button-test').addEventListener('click', async function () {
+		const workerBaseUrl = document.getElementById("http-api").value.trim();
+		const userJwt = document.getElementById("jwt-token").value.trim();
+		const downloadId = document.getElementById('download-id').value.trim();
 
-        if (!downloadId) {
-            log('❌ 请输入 Download ID');
-            return;
-        }
+		if (!downloadId) {
+			log('❌ 请输入 Download ID');
+			return;
+		}
 
-        try {
-            log(`⏳ 正在下载文件 (ID: ${downloadId})...`);
+		log(`⏳ 正在下载文件 (ID: ${downloadId})...`);
+		const res = await fetch(`${workerBaseUrl}/download/${downloadId}`, {
+			headers: {
+				'Authorization': `Bearer ${userJwt}`
+			}
+		});
 
-            const response = await fetch(`${workerBaseUrl}/download/${downloadId}`, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${userJwt}`
-                }
-            });
+		if (!res.ok) {
+			const err = await res.json().catch(() => ({}));
+			log(`❌ 下载失败: ${err.msg || res.statusText}`);
+			return;
+		}
 
-            if (!response.ok) {
-                const error = await response.json();
-                log(`❌ 下载失败: ${error.msg || response.statusText}`);
-                return;
-            }
+		const blob = await res.blob();
+		const disposition = res.headers.get('Content-Disposition');
+		let filename = downloadId;
+		if (disposition) {
+			const match = disposition.match(/filename="?([^"]+)"?/);
+			if (match) filename = match[1];
+		}
 
-            // Get filename from Content-Disposition header or use downloadId
-            const contentDisposition = response.headers.get('Content-Disposition');
-            let filename = downloadId;
-            if (contentDisposition) {
-                const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
-                if (filenameMatch && filenameMatch[1]) {
-                    filename = filenameMatch[1];
-                }
-            }
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = filename;
+		document.body.appendChild(a);
+		a.click();
+		URL.revokeObjectURL(url);
+		a.remove();
 
-            // Create download link and trigger click
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-
-            // Clean up
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(a);
-
-            log(`✅ 文件下载成功: ${filename}`);
-        } catch (error) {
-            log(`❌ 下载过程中出错: ${error.message}`);
-        }
-    });
+		log(`✅ 下载完成: ${filename}`);
+	});
 </script>
 </body>
 </html>
