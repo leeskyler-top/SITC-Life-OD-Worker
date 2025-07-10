@@ -10,6 +10,26 @@ function detectMimeFromMagicBytes(bytes) {
 	return 'application/octet-stream';
 }
 
+function isRefererAllowed(request, whitelist) {
+	const referer = request.headers.get("Referer") || "";
+	try {
+		const refererUrl = new URL(referer);
+		const hostname = refererUrl.hostname;
+		return whitelist.some(rule => {
+			if (rule === '*') return true;
+			if (rule.startsWith('*.')) {
+				// 匹配子域名
+				const base = rule.slice(2);
+				return hostname === base || hostname.endsWith('.' + base);
+			}
+			return hostname === rule;
+		});
+	} catch {
+		// 非法 Referer 格式
+		return false;
+	}
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
@@ -24,6 +44,12 @@ export default {
 			if (new Date(session.expirationDateTime).getTime() < now) {
 				uploadSessionMap.delete(key);
 			}
+		}
+
+		// ✅ Referer 白名单检查（建议放在此处，全局统一）
+		const whitelist = (env.REFERER_WHITELIST || '*').split(',').map(s => s.trim());
+		if (!isRefererAllowed(request, whitelist)) {
+			return jsonResponse({ status: 'fail', msg: 'Forbidden: Invalid Referer' }, 403);
 		}
 
 		const routeHandlers = {

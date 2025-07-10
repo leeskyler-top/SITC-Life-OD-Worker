@@ -1,6 +1,6 @@
 {
-	"name": "twlife-dev-od",
-	"version": "0.0.0",
+	"name": "twlife-od",
+	"version": "2.0.0",
 	"private": true,
 	"scripts": {
 		"deploy": "wrangler deploy",

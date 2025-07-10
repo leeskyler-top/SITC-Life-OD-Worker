@@ -170,6 +170,7 @@ dist
 
 .dev.vars
 wrangler.toml
+wrangler.development.toml
 wrangler.production.toml
 .wrangler/
 .idea
